@@ -9,6 +9,11 @@ export interface DonationCarbonResult {
   co2PerKg: number | null;
 }
 
+// Minimum share of component (fraction) for an ingredient to be considered
+// in the CO2 calculation / unmapped mass. Smaller ingredients (spices, traces)
+// are ignored entirely.
+const MIN_SHARE = 0.10; // 10%
+
 /**
  * Compute carbon impact for a single donation.
  * Pipeline:
@@ -116,13 +121,24 @@ export async function computeDonationCarbon(
 
   for (const ci of componentIngredients) {
     const share: number = ci.share_of_component ?? 0;
-    const cookedWeightKg = totalFoodMassKg * share;
 
+    // Ignore water & salt completely (no CO2, no unmapped)
+    if (ci.is_water || ci.is_salt) {
+      continue;
+    }
+
+    // Ignore very small ingredients (e.g. spices) under MIN_SHARE.
+    // They don't contribute to CO2 or to unmappedMass.
+    if (!share || share < MIN_SHARE) {
+      continue;
+    }
+
+    const cookedWeightKg = totalFoodMassKg * share;
     if (cookedWeightKg <= 0) continue;
 
     const mapping = mappingByCore.get(ci.ingredient_core);
 
-    // No mapping -> count whole weight as unmapped
+    // Significant ingredient, but no mapping yet -> count as unmapped mass.
     if (!mapping) {
       unmappedMass += cookedWeightKg;
       continue;
@@ -144,6 +160,7 @@ export async function computeDonationCarbon(
     if (factor == null) {
       const foodid = mapping.luke_foodid;
       if (typeof foodid !== 'number') {
+        // Mapping exists but no valid foodid; treat as unmapped mass
         unmappedMass += cookedWeightKg;
         continue;
       }
@@ -208,3 +225,5 @@ export async function computeDonationCarbon(
     co2PerKg,
   };
 }
+
+
