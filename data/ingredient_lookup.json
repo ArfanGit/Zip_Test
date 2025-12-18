@@ -1,0 +1,23 @@
+{
+  "peruna": {
+    "foodId": "204",
+    "note": "peeled new potato"
+  },
+  "broileri": {
+    "foodId": "751",
+    "note": "whole chicken (raw)"
+  },
+  "jauheliha": {
+    "foodId": "28930",
+    "note": "broiler mince"
+  },
+  "soija": {
+    "foodId": "391",
+    "note": "dry soybeans"
+  },
+  "riisi": {
+    "foodId": "156",
+    "note": "rice porridge"
+  }
+}
+

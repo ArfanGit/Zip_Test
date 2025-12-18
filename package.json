@@ -1,0 +1,29 @@
+{
+  "name": "co2-from-surplus",
+  "version": "0.1.0",
+  "description": "Tools to normalize restaurant ingredient data and compute CO₂e for surplus donations.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node srcsodexoImporter.ts",
+    "dev": "ts-node --transpile-only srcsodexoImporter.ts",
+    "type-check": "tsc --noEmit",
+    "match-demo": "ts-node src/matchDemo.ts",
+    "auto-match": "ts-node src/autoMatchRunner.ts",
+    "auto-match:approve": "ts-node src/autoMatchRunner.ts --auto-approve",
+    "demo": "ts-node src/demo.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.88.0",
+    "csv-parse": "^6.1.0",
+    "dotenv": "^17.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
