@@ -2,7 +2,7 @@
 import { db } from './dbClient';
 
 // IMPORTANT: set this to the component you want to inspect
-const COMPONENT_ID = 17; // e.g. your basmati component
+const COMPONENT_ID = 18; // e.g. your basmati component
 
 // Keep this in sync with carbonCalculator.ts
 const MIN_SHARE = 0.10; // 10%

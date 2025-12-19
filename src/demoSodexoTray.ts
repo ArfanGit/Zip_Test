@@ -1,66 +1,50 @@
 // src/demoSodexoTray.ts
+import 'dotenv/config';
 import { db } from './dbClient';
 import { computeDonationCarbon } from './carbonCalculator';
 
-// TODO: put your real values here (from Supabase)
-const COMPONENT_ID = 17;                // e.g. 17
-const INGREDIENT_CORE = 'RIISI_BASMATI_1KG_BASMATIRIISI_INTIA';     // e.g. 'RIISI_BASMATI_1KG_BASMATIRIISI_INTIA'
-const LUKE_FOODID = 11521;                // e.g. 4001
-
-// How much cooked food was donated (kg)
-const DONATED_WEIGHT_KG = 10;
-
 async function main() {
-  console.log('Using:');
-  console.log('  COMPONENT_ID   =', COMPONENT_ID);
-  console.log('  INGREDIENT_CORE=', INGREDIENT_CORE);
-  console.log('  LUKE_FOODID    =', LUKE_FOODID);
+  // 👉 Change this to test different components:
+  //  - 17 = basmati rice tray (your earlier demo)
+  //  - 18 = palak paneer tray (our new fully-mapped example)
+  const COMPONENT_ID = 18;
 
-  // 1) Upsert ingredient mapping
-  const { error: mapError } = await db.from('ingredient_mappings').upsert(
-    {
-      ingredient_core: INGREDIENT_CORE,
-      luke_foodid: LUKE_FOODID,
-      match_type: 'exact',
-      weight_state: 'cooked',      // simplified for now
-      yield_cooked_per_raw: null,  // later: set if you use raw factors + yields
-      co2_override_per_kg: null,
-      is_active: true,
-    },
-    { onConflict: 'ingredient_core' }
-  );
+  // How many kg of this component were donated (tray weight)
+  const DONATED_WEIGHT_KG = 10;
 
-  if (mapError) {
-    throw new Error('Error upserting ingredient_mappings: ' + mapError.message);
-  }
+  console.log('--- Demo: Sodexo component donation ---');
+  console.log('Component ID :', COMPONENT_ID);
+  console.log('Donated kg   :', DONATED_WEIGHT_KG);
 
-  console.log('Mapping upserted for', INGREDIENT_CORE);
-
-  // 2) Create a donation for this component
-  const { data: donationRows, error: donationError } = await db
+  // 1) Insert a test donation row
+  const { data: donation, error: insertError } = await db
     .from('donations')
     .insert({
-      kitchen_id: 'SODEXO_LADONLUKKO',
-      dish_id: null, // optional; computeDonationCarbon uses component_id
+      kitchen_id: 'SODEXO_LADONLUKKO',   // matches what we’ve used elsewhere
       component_id: COMPONENT_ID,
       donated_weight_kg: DONATED_WEIGHT_KG,
     })
-    .select('id')
+    .select()
     .single();
 
-  if (donationError || !donationRows) {
-    throw new Error('Error inserting donation: ' + donationError?.message);
+  if (insertError) {
+    console.error('Failed to insert donation:', insertError.message);
+    process.exit(1);
   }
 
-  const donationId = donationRows.id as number;
-  console.log('Created donation with id', donationId);
+  console.log('\nInserted donation:');
+  console.log(donation);
 
-  // 3) Compute CO2 for this donation
-  const result = await computeDonationCarbon(donationId);
-  console.log('Carbon result for Sodexo component donation:');
-  console.log(result);
+  // 2) Run the carbon calculator for this donation
+  const result = await computeDonationCarbon(donation.id);
+
+  console.log('\nCarbon result:');
+  console.log(JSON.stringify(result, null, 2));
+
+  console.log('\nDone.');
 }
 
 main().catch((err) => {
   console.error('demoSodexoTray failed:', err);
+  process.exit(1);
 });
