@@ -2,6 +2,8 @@
 import { db } from './dbClient';
 import { computeDonationCarbon } from './carbonCalculator';
 
+const SOURCE_SYSTEM = process.env.MAPPING_SOURCE_SYSTEM || 'SODEXO_LADONLUKKO';
+
 async function main() {
   // 1) Pick one Luke food (first row) just for demo
   const { data: foods, error: foodsError } = await db
@@ -16,20 +18,25 @@ async function main() {
   const food = foods[0] as any;
   console.log('Using Luke food for demo:', food);
 
-  // 2) Upsert ingredient mapping for a demo ingredient_core
+  // 2) Upsert ingredient mapping for a demo ingredient_core (Option B)
   const ingredientCore = 'DEMO_FOOD';
 
   const { error: mapError } = await db.from('ingredient_mappings').upsert(
     {
+      source_system: SOURCE_SYSTEM,
       ingredient_core: ingredientCore,
       luke_foodid: food.foodid,
-      match_type: 'exact',
-      weight_state: 'cooked', // factor is per kg cooked for this demo
+
+      // IMPORTANT: must satisfy DB CHECK constraint (match_type_valid)
+      match_type: 'manual',
+
+      ai_confidence: null,
+      weight_state: 'cooked',
       yield_cooked_per_raw: null,
       co2_override_per_kg: null,
       is_active: true,
     },
-    { onConflict: 'ingredient_core' }
+    { onConflict: 'source_system,ingredient_core' }
   );
 
   if (mapError) {
@@ -41,12 +48,13 @@ async function main() {
     .from('dishes')
     .insert({
       restaurant_id: 'DEMO_RESTAURANT',
-      sodexo_course_id: '1',
+      sodexo_course_id: '0',
       menu_date: new Date().toISOString().slice(0, 10),
+      title_fi: 'Demo dish',
       title_en: 'Demo dish',
-      title_fi: 'Demo annos',
-      category: 'Demo',
-      dietcodes: null,
+      title_sv: 'Demo dish',
+      category: 'demo',
+      dietcodes: '',
     })
     .select('id')
     .single();
@@ -81,7 +89,7 @@ async function main() {
     component_id: componentId,
     ingredient_raw: 'Demo ingredient',
     ingredient_core: ingredientCore,
-    share_of_component: 1.0, // 100%
+    share_of_component: 1.0,
     is_water: false,
     is_salt: false,
   });
@@ -90,16 +98,14 @@ async function main() {
     throw new Error('Error inserting demo ingredient: ' + ingError.message);
   }
 
-  // 6) Create a donation: 5 kg of this component
-  const donatedWeightKg = 5;
-
+  // 6) Insert a donation referencing this component
   const { data: donationRows, error: donationError } = await db
     .from('donations')
     .insert({
       kitchen_id: 'DEMO_KITCHEN',
       dish_id: dishId,
       component_id: componentId,
-      donated_weight_kg: donatedWeightKg,
+      donated_weight_kg: 5.0,
     })
     .select('id')
     .single();
@@ -118,4 +124,5 @@ async function main() {
 
 main().catch((err) => {
   console.error('Demo failed:', err);
+  process.exit(1);
 });
