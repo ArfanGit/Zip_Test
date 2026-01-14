@@ -22,6 +22,7 @@ export interface DonationCarbonResult {
 const MIN_SHARE_FRAC = 0.10; // ignore ingredient shares < 10% of component
 const PLATE_SHARE_NORMALIZE_EPS = 0.03; // normalize if sum close to 1
 const ING_SHARE_NORMALIZE_EPS = 5; // normalize if sum close to 100 (percentage points)
+const ING_SHARE_MAX_OVER_EPS = 0.5; // hard error if shares exceed 100% by more than this
 
 const SOURCE_SYSTEM = process.env.MAPPING_SOURCE_SYSTEM || "SODEXO";
 
@@ -109,6 +110,7 @@ async function computeComponentCarbon(
     return clamp(n, 0, 100);
   });
 
+  const hasMissingShare = sharePctByRow.some((v) => v == null);
   const validShares: number[] = sharePctByRow.map((v) => (v == null ? 0 : v));
   const sumPct = sumNums(validShares);
 
@@ -116,9 +118,18 @@ async function computeComponentCarbon(
     return { co2eKg: 0, unmappedKg: componentCookedWeightKg, mappedKg: 0, ignoredKg: 0 };
   }
 
-  // Normalize only if close to 100
+  // Invariant: ingredient shares cannot exceed 100%
+  // If they do, that's a data error (bad parse / bad source) and we should not silently “fix” it.
+  if (sumPct > 100 + ING_SHARE_MAX_OVER_EPS) {
+    throw new Error(
+      `component_id=${componentId} ingredient share_of_component sum exceeds 100% (sum=${sumPct.toFixed(2)}). Fix parsing/data.`
+    );
+  }
+
+  // Normalize only if close to 100 AND there are no missing shares.
+  // If any share_of_component is NULL, the remainder must be treated as unmapped (not normalized away).
   let normFactor = 1;
-  if (Math.abs(sumPct - 100) <= ING_SHARE_NORMALIZE_EPS) {
+  if (!hasMissingShare && Math.abs(sumPct - 100) <= ING_SHARE_NORMALIZE_EPS) {
     normFactor = 100 / sumPct;
   }
 
@@ -248,6 +259,7 @@ async function computeComponentCarbon(
     mappedKg += cookedKg;
   }
 
+  // If we did not normalize, remainder is unmapped (this includes the “missing share” case).
   if (unallocatedKg > 1e-9 && normFactor === 1) {
     unmappedKg += unallocatedKg;
   }
@@ -330,9 +342,17 @@ export async function computeDonationCarbon(donationId: number): Promise<Donatio
         }
 
         const sumFinal = sumNums(shares);
+        // Invariant: dish component shares cannot exceed 1.0
+        if (sumFinal > 1 + PLATE_SHARE_NORMALIZE_EPS) {
+          throw new Error(
+            `dish_id=${dish_id} dish_components plate_share sum exceeds 1.0 (sum=${sumFinal.toFixed(
+              4
+            )}). Fix AI/manual plate_share values.`
+          );
+        }
+
+        // Keep prior behavior only for tiny floating error (close-to-1 normalization)
         if (sumFinal > 0 && Math.abs(sumFinal - 1) <= PLATE_SHARE_NORMALIZE_EPS) {
-          shares = shares.map((s) => s / sumFinal);
-        } else if (sumFinal > 1) {
           shares = shares.map((s) => s / sumFinal);
         }
       }

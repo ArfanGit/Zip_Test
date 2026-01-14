@@ -114,6 +114,55 @@ function clamp01(x: number): number {
   return x;
 }
 
+async function fetchAllDishIdsForRestaurantPaged(restaurantId: string): Promise<number[]> {
+  const out: number[] = [];
+  const PAGE_SIZE = 1000;
+  let from = 0;
+
+  while (true) {
+    const { data, error } = await supabase.from("dishes").select("id").eq("restaurant_id", restaurantId).range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+
+    const rows = (data || []) as any[];
+    for (const r of rows) {
+      const id = Number(r.id);
+      if (Number.isFinite(id)) out.push(id);
+    }
+
+    if (rows.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+
+  return out;
+}
+
+async function fetchAllNeedsDishIdsPaged(): Promise<Set<number>> {
+  const out = new Set<number>();
+  const PAGE_SIZE = 1000;
+  let from = 0;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from("dish_components")
+      .select("dish_id")
+      .or("component_type.eq.unknown,plate_share.is.null")
+      .range(from, from + PAGE_SIZE - 1);
+
+    if (error) throw error;
+
+    const rows = (data || []) as any[];
+    for (const r of rows) {
+      const id = Number(r.dish_id);
+      if (Number.isFinite(id)) out.add(id);
+    }
+
+    if (rows.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+
+  return out;
+}
+
 async function resolveRestaurantId(): Promise<string> {
   const rid = getArg("--restaurant-id");
   if (rid) return rid;
@@ -244,6 +293,7 @@ function strictSchema() {
 
 async function callAI(dish: DishRow, comps: ComponentRow[], retryHint: string | null): Promise<AiComponent[]> {
   const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini-2024-07-18";
+  const MAX_OUT = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || "2000");
 
   const response = await openai.responses.create({
     model: MODEL,
@@ -263,7 +313,7 @@ async function callAI(dish: DishRow, comps: ComponentRow[], retryHint: string | 
         schema: strictSchema(),
       },
     },
-    max_output_tokens: 700,
+    max_output_tokens: Number.isFinite(MAX_OUT) && MAX_OUT > 0 ? MAX_OUT : 2000,
   });
 
   const jsonText = getOutputText(response);
@@ -524,26 +574,11 @@ async function main() {
   const dryRun = hasFlag("--dry-run");
 
   // Dish ids needing AI: unknown type OR missing plate_share
-  const { data: needs, error } = await supabase
-    .from("dish_components")
-    .select("dish_id")
-    .or("component_type.eq.unknown,plate_share.is.null")
-    .limit(5000);
-  if (error) throw error;
-
-  const needsSet = new Set<number>((needs as any[]).map((r) => Number(r.dish_id)).filter(Boolean));
+  const needsSet = await fetchAllNeedsDishIdsPaged();
 
   // Dishes for this restaurant
-  const { data: dishRows, error: dishErr } = await supabase
-    .from("dishes")
-    .select("id")
-    .eq("restaurant_id", restaurantId);
-  if (dishErr) throw dishErr;
-
-  const dishIds = (dishRows as any[])
-    .map((d) => Number(d.id))
-    .filter((id) => needsSet.has(id))
-    .slice(0, limit);
+  const allDishIds = await fetchAllDishIdsForRestaurantPaged(restaurantId);
+  const dishIds = allDishIds.filter((id) => needsSet.has(id)).slice(0, limit);
 
   const runId = crypto.randomUUID();
   console.log(`[AI] restaurant_id=${restaurantId} dishes_to_process=${dishIds.length} dryRun=${dryRun} run_id=${runId}`);
