@@ -62,6 +62,17 @@ function sumNums(arr: number[]): number {
   return arr.reduce<number>((acc, v) => acc + v, 0);
 }
 
+function normalizeCoreFromName(nameRaw: string): string {
+  let s = (nameRaw || "").trim().toUpperCase();
+  s = s.replace(/Ä/g, "A").replace(/Ö/g, "O").replace(/Å/g, "A");
+  s = s.replace(/\b\d+[.,]?\d*\s*(KG|G|L|DL|CL|ML)\b/g, " ");
+  s = s.replace(/\b\d+[.,]?\d*\b/g, " ");
+  s = s.replace(/\b(RTU|KPA|LTN|TANKO)\b/g, " ");
+  s = s.replace(/[^A-Z0-9]+/g, "_");
+  s = s.replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+  return s || "UNKNOWN";
+}
+
 function getCo2FactorKgPerKg(mapping: MappingRow | undefined, food: LukeFoodRow | undefined): number | null {
   // 1) override wins
   const override = mapping?.co2_override_per_kg ?? null;
@@ -78,6 +89,90 @@ function getCo2FactorKgPerKg(mapping: MappingRow | undefined, food: LukeFoodRow 
   if (g !== null) return g * 0.01;
 
   return null;
+}
+
+async function computeComponentFallbackCarbonFromName(
+  componentId: number,
+  componentCookedWeightKg: number
+): Promise<{ co2eKg: number; unmappedKg: number; mappedKg: number; ignoredKg: number }> {
+  const { data: comp, error: compErr } = await db.from("dish_components").select("id, name_raw").eq("id", componentId).single();
+  if (compErr || !comp) {
+    return { co2eKg: 0, unmappedKg: componentCookedWeightKg, mappedKg: 0, ignoredKg: 0 };
+  }
+
+  const core = normalizeCoreFromName(String((comp as any).name_raw || ""));
+  if (!core || core === "UNKNOWN") {
+    return { co2eKg: 0, unmappedKg: componentCookedWeightKg, mappedKg: 0, ignoredKg: 0 };
+  }
+
+  const { data: mappingsData, error: mapError } = await db
+    .from("ingredient_mappings")
+    .select("ingredient_core, luke_foodid, weight_state, yield_cooked_per_raw, co2_override_per_kg")
+    .eq("source_system", SOURCE_SYSTEM)
+    .eq("is_active", true)
+    .eq("ingredient_core", core)
+    .limit(1);
+
+  if (mapError) throw new Error(`Error loading ingredient_mappings (component fallback): ${mapError.message}`);
+
+  const m = (mappingsData || [])[0] as any;
+  if (!m) {
+    return { co2eKg: 0, unmappedKg: componentCookedWeightKg, mappedKg: 0, ignoredKg: 0 };
+  }
+
+  const mapping: MappingRow = {
+    ingredient_core: String(m.ingredient_core),
+    luke_foodid: m.luke_foodid == null ? null : Number(m.luke_foodid),
+    weight_state: m.weight_state == null ? null : String(m.weight_state),
+    yield_cooked_per_raw: toNum(m.yield_cooked_per_raw),
+    co2_override_per_kg: toNum(m.co2_override_per_kg),
+  };
+
+  const weightState = (mapping.weight_state || "ignore").toLowerCase();
+  if (weightState === "ignore") {
+    return { co2eKg: 0, unmappedKg: 0, mappedKg: 0, ignoredKg: componentCookedWeightKg };
+  }
+
+  let food: LukeFoodRow | undefined;
+  if (mapping.luke_foodid != null) {
+    const { data: foodsData, error: foodsError } = await db
+      .from("luke_foods")
+      .select("foodid, kg_co2e_per_kg, g_co2e_per_100g")
+      .eq("foodid", mapping.luke_foodid)
+      .limit(1);
+
+    if (foodsError) throw new Error(`Error loading luke_foods (component fallback): ${foodsError.message}`);
+    const f = (foodsData || [])[0] as any;
+    if (f) {
+      food = {
+        foodid: Number(f.foodid),
+        kg_co2e_per_kg: toNum(f.kg_co2e_per_kg),
+        g_co2e_per_100g: toNum(f.g_co2e_per_100g),
+      };
+    }
+  }
+
+  const factor = getCo2FactorKgPerKg(mapping, food);
+  if (factor === null) {
+    return { co2eKg: 0, unmappedKg: componentCookedWeightKg, mappedKg: 0, ignoredKg: 0 };
+  }
+
+  let massForFactorKg = componentCookedWeightKg;
+  if (weightState === "raw") {
+    const y = mapping.yield_cooked_per_raw;
+    if (y != null && y > 0) {
+      massForFactorKg = componentCookedWeightKg / y;
+    } else {
+      return { co2eKg: 0, unmappedKg: componentCookedWeightKg, mappedKg: 0, ignoredKg: 0 };
+    }
+  }
+
+  return {
+    co2eKg: massForFactorKg * factor,
+    unmappedKg: 0,
+    mappedKg: componentCookedWeightKg,
+    ignoredKg: 0,
+  };
 }
 
 async function computeComponentCarbon(
@@ -98,7 +193,8 @@ async function computeComponentCarbon(
   const ingredients = (ingredientsData || []) as IngredientRow[];
 
   if (ingredients.length === 0) {
-    return { co2eKg: 0, unmappedKg: componentCookedWeightKg, mappedKg: 0, ignoredKg: 0 };
+    // Fallback: map by component name when ingredient breakdown is missing
+    return await computeComponentFallbackCarbonFromName(componentId, componentCookedWeightKg);
   }
 
   // Shares
@@ -115,7 +211,8 @@ async function computeComponentCarbon(
   const sumPct = sumNums(validShares);
 
   if (sumPct <= 0) {
-    return { co2eKg: 0, unmappedKg: componentCookedWeightKg, mappedKg: 0, ignoredKg: 0 };
+    // Unusable ingredient shares; try component-name fallback mapping
+    return await computeComponentFallbackCarbonFromName(componentId, componentCookedWeightKg);
   }
 
   // Invariant: ingredient shares cannot exceed 100%

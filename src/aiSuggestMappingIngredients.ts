@@ -186,6 +186,17 @@ function isLikelyUuid(s: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test((s || '').trim());
 }
 
+function normalizeCoreFromName(nameRaw: string): string {
+  let s = (nameRaw || '').trim().toUpperCase();
+  s = s.replace(/Ä/g, 'A').replace(/Ö/g, 'O').replace(/Å/g, 'A');
+  s = s.replace(/\b\d+[.,]?\d*\s*(KG|G|L|DL|CL|ML)\b/g, ' ');
+  s = s.replace(/\b\d+[.,]?\d*\b/g, ' ');
+  s = s.replace(/\b(RTU|KPA|LTN|TANKO)\b/g, ' ');
+  s = s.replace(/[^A-Z0-9]+/g, '_');
+  s = s.replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+  return s || 'UNKNOWN';
+}
+
 // ---------------------- DB helpers ----------------------
 
 async function loadRawExamples(ingredientCore: string, limit = 8): Promise<string[]> {
@@ -320,6 +331,28 @@ async function fetchAllDishIdsForRestaurant(restaurantId: string, dateFrom?: str
   return all;
 }
 
+async function fetchDishIdsPageForRestaurant(args: {
+  restaurantId: string;
+  from: number;
+  size: number;
+  dateFrom?: string;
+  dateTo?: string;
+}): Promise<number[]> {
+  let q = db.from('dishes').select('id').eq('restaurant_id', args.restaurantId);
+  if (args.dateFrom) q = q.gte('menu_date', args.dateFrom);
+  if (args.dateTo) q = q.lte('menu_date', args.dateTo);
+
+  const { data, error } = await q.range(args.from, args.from + args.size - 1);
+  if (error) throw new Error(`Failed to load dishes page for restaurant: ${error.message}`);
+
+  const out: number[] = [];
+  for (const r of (data || []) as any[]) {
+    const id = Number(r.id);
+    if (Number.isFinite(id)) out.push(id);
+  }
+  return out;
+}
+
 async function fetchComponentIdsForDishIds(dishIds: number[]): Promise<number[]> {
   const out: number[] = [];
   for (const chunkIds of chunk(dishIds, IN_CHUNK)) {
@@ -337,6 +370,64 @@ async function fetchComponentIdsForDishIds(dishIds: number[]): Promise<number[]>
     }
   }
   return out;
+}
+
+async function fetchComponentNameCoresForComponentIds(componentIds: number[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const chunkIds of chunk(componentIds, IN_CHUNK)) {
+    let from = 0;
+    while (true) {
+      const { data, error } = await db
+        .from('dish_components')
+        .select('id, name_raw')
+        .in('id', chunkIds)
+        .range(from, from + PAGE_SIZE - 1);
+
+      if (error) throw new Error(`Failed to load dish_components names: ${error.message}`);
+
+      const rows = (data || []) as any[];
+      for (const r of rows) {
+        const nm = String(r.name_raw || '').trim();
+        if (!nm) continue;
+        const core = normalizeCoreFromName(nm);
+        if (core && core !== 'UNKNOWN') out.push(core);
+      }
+
+      if (rows.length < PAGE_SIZE) break;
+      from += PAGE_SIZE;
+    }
+  }
+  return uniqStrings(out);
+}
+
+async function filterComponentIdsMissingIngredients(componentIds: number[]): Promise<number[]> {
+  if (componentIds.length === 0) return [];
+
+  const has = new Set<number>();
+
+  for (const chunkIds of chunk(componentIds, IN_CHUNK)) {
+    let from = 0;
+    while (true) {
+      const { data, error } = await db
+        .from('component_ingredients')
+        .select('component_id')
+        .in('component_id', chunkIds)
+        .range(from, from + PAGE_SIZE - 1);
+
+      if (error) throw new Error(`Failed to load component_ingredients: ${error.message}`);
+
+      const rows = (data || []) as any[];
+      for (const r of rows) {
+        const id = Number(r.component_id);
+        if (Number.isFinite(id)) has.add(id);
+      }
+
+      if (rows.length < PAGE_SIZE) break;
+      from += PAGE_SIZE;
+    }
+  }
+
+  return componentIds.filter((id) => !has.has(id));
 }
 
 async function fetchIngredientCoresForComponentIds(componentIds: number[]): Promise<string[]> {
@@ -731,23 +822,67 @@ do update set
   console.log('mode = batch');
   console.log(`restaurant = ${info.branch_name}${info.city ? ', ' + info.city : ''} (${info.source_system})`);
 
-  const dishIds = await fetchAllDishIdsForRestaurant(restaurantId, opt.dateFrom, opt.dateTo);
-  console.log(`dishes_found = ${dishIds.length}`);
+  // Memory-bounded selection: don't load *all* dish/component/core ids when user only wants --limit N.
+  // We'll page through dishes -> components -> cores until we have enough.
+  const coresSet = new Set<string>();
+  const dishPageSize = 250;
+  let dishOffset = 0;
 
-  if (dishIds.length === 0) {
-    console.log('No dishes found. Done.');
-    return;
+  let dishesSeen = 0;
+  let componentsSeen = 0;
+  let componentNamesAdded = 0;
+
+  // Overfetch a bit to account for filtering (corePrefix, includeMapped=false, etc)
+  const target = Math.max(opt.limit, 50);
+  const softTarget = Math.min(target * 3, target + 1000);
+
+  while (coresSet.size < softTarget) {
+    const dishIdsPage = await fetchDishIdsPageForRestaurant({
+      restaurantId,
+      from: dishOffset,
+      size: dishPageSize,
+      dateFrom: opt.dateFrom,
+      dateTo: opt.dateTo,
+    });
+
+    if (dishIdsPage.length === 0) break;
+    dishOffset += dishPageSize;
+    dishesSeen += dishIdsPage.length;
+
+    const componentIdsPage = await fetchComponentIdsForDishIds(dishIdsPage);
+    componentsSeen += componentIdsPage.length;
+
+    if (componentIdsPage.length === 0) continue;
+
+    let chunkCores = await fetchIngredientCoresForComponentIds(componentIdsPage);
+
+    const missingIngredientComponentIds = await filterComponentIdsMissingIngredients(componentIdsPage);
+    if (missingIngredientComponentIds.length) {
+      const componentNameCores = await fetchComponentNameCoresForComponentIds(missingIngredientComponentIds);
+      componentNamesAdded += componentNameCores.length;
+      chunkCores = uniqStrings([...chunkCores, ...componentNameCores]);
+    }
+
+    if (opt.corePrefix) {
+      const p = String(opt.corePrefix).trim();
+      if (p) chunkCores = chunkCores.filter((c) => c.startsWith(p));
+    }
+
+    if (!opt.includeMapped) {
+      chunkCores = await filterUnmappedCores(opt.sourceSystem, chunkCores);
+    }
+
+    for (const c of chunkCores) {
+      coresSet.add(c);
+      if (coresSet.size >= softTarget) break;
+    }
   }
 
-  const componentIds = await fetchComponentIdsForDishIds(dishIds);
-  console.log(`components_found = ${componentIds.length}`);
+  console.log(`dishes_scanned ~= ${dishesSeen}`);
+  console.log(`components_scanned ~= ${componentsSeen}`);
+  if (componentNamesAdded) console.log(`component_name_cores_added ~= ${componentNamesAdded}`);
 
-  if (componentIds.length === 0) {
-    console.log('No dish_components found. Done.');
-    return;
-  }
-
-  let cores = await fetchIngredientCoresForComponentIds(componentIds);
+  let cores = Array.from(coresSet);
 
   if (opt.corePrefix) {
     const p = String(opt.corePrefix).trim();

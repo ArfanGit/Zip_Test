@@ -38,6 +38,7 @@ type DishComponentRow = {
   name_raw: string | null;
   component_type: string | null;
   plate_share: number | null;
+  ingredients_raw?: string | null;
 };
 
 type ComponentIngredientRow = {
@@ -80,6 +81,17 @@ function clamp(n: number, lo: number, hi: number): number {
 
 function sumNums(arr: number[]): number {
   return arr.reduce<number>((acc, v) => acc + v, 0);
+}
+
+function normalizeCoreFromName(nameRaw: string): string {
+  let s = (nameRaw || "").trim().toUpperCase();
+  s = s.replace(/Ä/g, "A").replace(/Ö/g, "O").replace(/Å/g, "A");
+  s = s.replace(/\b\d+[.,]?\d*\s*(KG|G|L|DL|CL|ML)\b/g, " ");
+  s = s.replace(/\b\d+[.,]?\d*\b/g, " ");
+  s = s.replace(/\b(RTU|KPA|LTN|TANKO)\b/g, " ");
+  s = s.replace(/[^A-Z0-9]+/g, "_");
+  s = s.replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+  return s || "UNKNOWN";
 }
 
 function resolveFactor(mapping: MappingRow | undefined, food: LukeFoodRow | undefined): { source: string; value: number | null } {
@@ -236,7 +248,7 @@ async function loadRestaurant(restaurantId: string): Promise<{ id: string; label
 async function loadDishComponents(dishId: number): Promise<DishComponentRow[]> {
   const { data, error } = await db
     .from("dish_components")
-    .select("id, dish_id, name_raw, component_type, plate_share")
+    .select("id, dish_id, name_raw, component_type, plate_share, ingredients_raw")
     .eq("dish_id", dishId)
     .order("id", { ascending: true });
 
@@ -248,6 +260,7 @@ async function loadDishComponents(dishId: number): Promise<DishComponentRow[]> {
     name_raw: r.name_raw ?? null,
     component_type: r.component_type ?? null,
     plate_share: r.plate_share == null ? null : Number(r.plate_share),
+    ingredients_raw: r.ingredients_raw == null ? null : String(r.ingredients_raw),
   }));
 }
 
@@ -338,12 +351,13 @@ export async function computeDonationBreakdown(donationId: number): Promise<Dona
   let allocations: Array<{
     component: DishComponentRow;
     component_weight_kg: number;
+    used_component_fallback: boolean;
   }> = [];
 
   if (donation.component_id != null) {
     const { data, error } = await db
       .from("dish_components")
-      .select("id, dish_id, name_raw, component_type, plate_share")
+      .select("id, dish_id, name_raw, component_type, plate_share, ingredients_raw")
       .eq("id", donation.component_id)
       .maybeSingle();
 
@@ -356,6 +370,7 @@ export async function computeDonationBreakdown(donationId: number): Promise<Dona
           name_raw: (data as any).name_raw ?? null,
           component_type: (data as any).component_type ?? null,
           plate_share: (data as any).plate_share == null ? null : Number((data as any).plate_share),
+          ingredients_raw: (data as any).ingredients_raw == null ? null : String((data as any).ingredients_raw),
         }
       : {
           id: donation.component_id,
@@ -363,9 +378,10 @@ export async function computeDonationBreakdown(donationId: number): Promise<Dona
           name_raw: "(missing dish_components row)",
           component_type: null,
           plate_share: null,
+          ingredients_raw: null,
         };
 
-    allocations = [{ component: comp, component_weight_kg: donatedWeightKg }];
+    allocations = [{ component: comp, component_weight_kg: donatedWeightKg, used_component_fallback: false }];
   } else {
     if (donation.dish_id == null) throw new Error(`Donation ${donationId} has neither dish_id nor component_id`);
 
@@ -409,13 +425,24 @@ export async function computeDonationBreakdown(donationId: number): Promise<Dona
     }
 
     const shares = normalizeComponentShares(comps);
-    allocations = comps.map((c, i) => ({ component: c, component_weight_kg: donatedWeightKg * shares[i] }));
+    allocations = comps.map((c, i) => ({ component: c, component_weight_kg: donatedWeightKg * shares[i], used_component_fallback: false }));
   }
 
   const componentIds = allocations.map((a) => a.component.id);
   const allIngs = await loadComponentIngredients(componentIds);
 
-  const cores = Array.from(new Set(allIngs.map((r) => r.ingredient_core)));
+  // Load mappings for:
+  // - ingredient-level cores (from component_ingredients)
+  // - component-level fallback cores (normalized from dish_components.name_raw) for components that have no ingredient rows
+  const coresSet = new Set<string>(allIngs.map((r) => r.ingredient_core));
+  const hasIngredientsForComponent = new Set<number>(allIngs.map((r) => r.component_id));
+  for (const alloc of allocations) {
+    if (hasIngredientsForComponent.has(alloc.component.id)) continue;
+    const core = normalizeCoreFromName(String(alloc.component.name_raw || ""));
+    if (core && core !== "UNKNOWN") coresSet.add(core);
+  }
+
+  const cores = Array.from(coresSet);
   const mappings = await loadMappings(cores);
 
   const foodids = Array.from(
@@ -446,25 +473,136 @@ export async function computeDonationBreakdown(donationId: number): Promise<Dona
       .sort((a, b) => (a.seq_no ?? 9999) - (b.seq_no ?? 9999));
 
     if (!compIngs.length) {
-      unmappedMass += componentWeightKg;
+      // Component-level fallback: treat the whole component as one mappable "core" derived from name_raw.
+      // We store these mappings in ingredient_mappings under the same source_system.
+      const componentCore = normalizeCoreFromName(componentName);
+      const mapping = componentCore ? mappings.get(componentCore) : undefined;
+      const weightState = (mapping?.weight_state || "ignore").toLowerCase();
+
+      if (!mapping) {
+        unmappedMass += componentWeightKg;
+        items.push({
+          status: "unmapped",
+          reason: "no component_ingredients rows; no component-name mapping",
+          component_id: componentId,
+          component_name: componentName,
+          component_type: componentType,
+          component_weight_kg: componentWeightKg,
+          ingredient_core: componentCore || "UNKNOWN",
+          base_name: componentName,
+          share_pct: null,
+          cooked_mass_kg: componentWeightKg,
+          luke_foodid: null,
+          luke_name_fi: null,
+          luke_name_en: null,
+          factor_source: "none",
+          factor_kgco2_per_kg: null,
+          mass_for_factor_kg: 0,
+          co2e_kg: 0,
+        });
+        continue;
+      }
+
+      if (weightState === "ignore") {
+        ignoredMass += componentWeightKg;
+        items.push({
+          status: "ignored",
+          reason: "component-level fallback; mapping weight_state=ignore",
+          component_id: componentId,
+          component_name: componentName,
+          component_type: componentType,
+          component_weight_kg: componentWeightKg,
+          ingredient_core: componentCore,
+          base_name: componentName,
+          share_pct: null,
+          cooked_mass_kg: componentWeightKg,
+          luke_foodid: mapping.luke_foodid,
+          luke_name_fi: null,
+          luke_name_en: null,
+          factor_source: "none",
+          factor_kgco2_per_kg: null,
+          mass_for_factor_kg: 0,
+          co2e_kg: 0,
+        });
+        continue;
+      }
+
+      const food = mapping.luke_foodid != null ? lukeFoods.get(mapping.luke_foodid) : undefined;
+      const factor = resolveFactor(mapping, food);
+      if (factor.value == null) {
+        unmappedMass += componentWeightKg;
+        items.push({
+          status: "unmapped",
+          reason: "component-level fallback; no CO2 factor",
+          component_id: componentId,
+          component_name: componentName,
+          component_type: componentType,
+          component_weight_kg: componentWeightKg,
+          ingredient_core: componentCore,
+          base_name: componentName,
+          share_pct: null,
+          cooked_mass_kg: componentWeightKg,
+          luke_foodid: mapping.luke_foodid,
+          luke_name_fi: food?.name_fi ?? null,
+          luke_name_en: food?.name_en ?? null,
+          factor_source: "none",
+          factor_kgco2_per_kg: null,
+          mass_for_factor_kg: 0,
+          co2e_kg: 0,
+        });
+        continue;
+      }
+
+      let massForFactorKg = componentWeightKg;
+      if (weightState === "raw") {
+        const y = mapping.yield_cooked_per_raw;
+        if (y != null && y > 0) massForFactorKg = componentWeightKg / y;
+        else {
+          unmappedMass += componentWeightKg;
+          items.push({
+            status: "unmapped",
+            reason: "component-level fallback; weight_state=raw but yield missing/invalid",
+            component_id: componentId,
+            component_name: componentName,
+            component_type: componentType,
+            component_weight_kg: componentWeightKg,
+            ingredient_core: componentCore,
+            base_name: componentName,
+            share_pct: null,
+            cooked_mass_kg: componentWeightKg,
+            luke_foodid: mapping.luke_foodid,
+            luke_name_fi: food?.name_fi ?? null,
+            luke_name_en: food?.name_en ?? null,
+            factor_source: factor.source,
+            factor_kgco2_per_kg: factor.value,
+            mass_for_factor_kg: 0,
+            co2e_kg: 0,
+          });
+          continue;
+        }
+      }
+
+      const co2 = massForFactorKg * factor.value;
+      mappedMass += componentWeightKg;
+      totalCo2 += co2;
       items.push({
-        status: "unmapped",
-        reason: "no component_ingredients rows",
+        status: "mapped",
+        reason: "component-level fallback (no ingredient breakdown)",
         component_id: componentId,
         component_name: componentName,
         component_type: componentType,
         component_weight_kg: componentWeightKg,
-        ingredient_core: "NO_COMPONENT_INGREDIENTS",
-        base_name: "NO_COMPONENT_INGREDIENTS",
+        ingredient_core: componentCore,
+        base_name: componentName,
         share_pct: null,
         cooked_mass_kg: componentWeightKg,
-        luke_foodid: null,
-        luke_name_fi: null,
-        luke_name_en: null,
-        factor_source: "none",
-        factor_kgco2_per_kg: null,
-        mass_for_factor_kg: 0,
-        co2e_kg: 0,
+        luke_foodid: mapping.luke_foodid,
+        luke_name_fi: food?.name_fi ?? null,
+        luke_name_en: food?.name_en ?? null,
+        factor_source: factor.source,
+        factor_kgco2_per_kg: factor.value,
+        mass_for_factor_kg: massForFactorKg,
+        co2e_kg: co2,
       });
       continue;
     }

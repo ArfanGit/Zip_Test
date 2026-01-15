@@ -1,6 +1,8 @@
 {
   "scripts": {
     "cli:donate": "ts-node src/cliDonate.ts",
+    "donation:show": "ts-node src/cliDonationById.ts",
+    "donations:range": "ts-node src/cliDonationsByRange.ts",
     "ingest:url": "ts-node src/ingestFromUrl.ts"
   },
   "dependencies": {
